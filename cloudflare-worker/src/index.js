@@ -77,47 +77,50 @@ async function readToken(env, tok) {
 }
 
 // ------------------------------------------------------------------ store (KV)
+// Builds and users are keyed individually (build:<id>, user:<id>). We enumerate
+// via KV's native list() with a prefix cursor rather than maintaining a separate
+// "idx" array -- that array was a read-modify-write race across edge locations
+// and silently lost builds when concurrent writes clobbered it. list() reflects
+// the actual stored keys, so nothing gets dropped.
 class Store {
   constructor(kv) { this.kv = kv; }
   async get(k) { const v = await this.kv.get(k); return v ? JSON.parse(v) : null; }
   async set(k, v) { await this.kv.put(k, JSON.stringify(v)); }
   async del(k) { await this.kv.delete(k); }
 
-  async indexUsers() { return (await this.get("idx:users")) || []; }
-  async saveUser(u) {
-    await this.set(`user:${u.id}`, u);
-    const idx = await this.indexUsers();
-    if (!idx.includes(u.id)) { idx.push(u.id); await this.set("idx:users", idx); }
+  // Enumerate all keys under a prefix, following KV cursors.
+  async _keysWithPrefix(prefix) {
+    const names = []; let cursor;
+    do {
+      const page = await this.kv.list({ prefix, cursor });
+      for (const k of page.keys) names.push(k.name);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return names;
   }
+
+  async saveUser(u) { await this.set(`user:${u.id}`, u); }
   async findByName(name) {
-    for (const id of await this.indexUsers()) {
-      const u = await this.get(`user:${id}`);
+    for (const key of await this._keysWithPrefix("user:")) {
+      const u = await this.get(key);
       if (u && u.username.toLowerCase() === String(name).toLowerCase()) return u;
     }
     return null;
   }
   async listUsers() {
     const out = [];
-    for (const id of await this.indexUsers()) { const u = await this.get(`user:${id}`); if (u) out.push(u); }
+    for (const key of await this._keysWithPrefix("user:")) { const u = await this.get(key); if (u) out.push(u); }
     return out.sort((a, b) => a.created - b.created);
   }
   async deleteUser(id) {
     await this.del(`user:${id}`);
-    const idx = (await this.indexUsers()).filter((x) => x !== id);
-    await this.set("idx:users", idx);
-    // drop their builds
-    for (const b of await this.listBuilds()) if (b.uid === id) await this.del(`build:${b.id}`);
+    for (const b of await this.listBuilds()) if (b.uid === id) { await this.del(`build:${b.id}`); await this.del(`blob:${b.id}`); }
   }
 
-  async indexBuilds() { return (await this.get("idx:builds")) || []; }
-  async saveBuild(b) {
-    await this.set(`build:${b.id}`, b);
-    const idx = await this.indexBuilds();
-    if (!idx.includes(b.id)) { idx.push(b.id); await this.set("idx:builds", idx); }
-  }
+  async saveBuild(b) { await this.set(`build:${b.id}`, b); }
   async listBuilds() {
     const out = [];
-    for (const id of await this.indexBuilds()) { const b = await this.get(`build:${id}`); if (b) out.push(b); }
+    for (const key of await this._keysWithPrefix("build:")) { const b = await this.get(key); if (b) out.push(b); }
     return out;
   }
 }
@@ -191,7 +194,7 @@ async function triggerGitHubBuild(env, buildId) {
   const url = `https://api.github.com/repos/${encodeURIComponent(GH_OWNER)}/` +
               `${encodeURIComponent(GH_REPO)}/actions/workflows/${encodeURIComponent(GH_WORKFLOW_ID)}/dispatches`;
   try {
-    await fetch(url, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: {
         authorization: `Bearer ${GH_PAT}`,
@@ -202,12 +205,13 @@ async function triggerGitHubBuild(env, buildId) {
       // build_id is our own hex id, safe as a workflow input value.
       body: JSON.stringify({ ref: "main", inputs: { build_id: buildId } }),
     });
-  } catch (_) { /* best-effort; never surface to the caller */ }
+    if (!resp.ok) console.error(`gh dispatch failed ${resp.status}: ${await resp.text()}`);
+  } catch (e) { console.error("gh dispatch threw:", e && e.message); }
 }
 
 // ------------------------------------------------------------------ bootstrap admin
 async function ensureAdmin(env, store) {
-  if ((await store.indexUsers()).length) return;         // any user exists -> skip
+  if ((await store.listUsers()).length) return;           // any user exists -> skip
   const uname = env.ADMIN_USER || "admin";
   const pass = env.ADMIN_PASS;
   if (!pass) return;                                      // none configured -> no bootstrap
@@ -341,9 +345,7 @@ async function handle(ctx, env, store) {
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);                 // only owner or admin can remove it
     await store.del(`blob:${id}`);            // drop the stored exe first
-    await store.del(`build:${id}`);
-    const idx = (await store.indexBuilds()).filter((x) => x !== id);
-    await store.set("idx:builds", idx);
+    await store.del(`build:${id}`);           // list() reflects this immediately; no index to fix
     return json({ ok: true, deleted: id });
   }
 
@@ -392,15 +394,14 @@ export default {
     const cors = corsHeaders(request.headers.get("origin"), env.ALLOWED_ORIGIN);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
     const store = new Store(env.PANEL_KV);
-    // Collect deferred work (GitHub build triggers) and run it after responding.
-    const deferred = [];
-    const handlerCtx = { request, waitUntil: (p) => deferred.push(p) };
+    // Pass the REAL Cloudflare ctx through so ctx.waitUntil() actually extends
+    // the request lifetime. A hand-made waitUntil that runs after we return the
+    // Response gets frozen by the runtime before the GitHub dispatch finishes --
+    // that was why builds stayed queued.
     try {
       await ensureAdmin(env, store);
-      const res = await handle(handlerCtx, env, store);
+      const res = await handle({ request, waitUntil: (p) => ctx.waitUntil(p) }, env, store);
       for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
-      // Fire background tasks without delaying the response; swallow their errors.
-      Promise.allSettled(deferred).catch(() => {});
       return res;
     } catch (e) {
       const status = e instanceof ApiError ? e.status : 500;
