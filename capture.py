@@ -236,7 +236,7 @@ def _decrypt_chromium_value(blob: bytes, keys: list[tuple[bytes, str]]) -> tuple
         return "", "app-bound-v20(not-recoverable-outside-browser)"
     if prefix == b"v12":
         return "", "secret-portal-v12(not-recoverable-from-files)"
-    from Cryptodome.Cipher import AES
+    from Crypto.Cipher import AES
     data = blob[3:]
     for key, src in keys:
         # CBC path - only ever correct for v10.

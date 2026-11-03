@@ -1,7 +1,7 @@
 requests
 requests-toolbelt
 psutil
-pycryptodomex
+pycryptodome
 flask
 secretstorage; sys_platform != "win32"
 pywin32; sys_platform == "win32"

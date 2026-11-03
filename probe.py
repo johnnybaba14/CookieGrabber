@@ -206,7 +206,7 @@ def _verify_gcm(key: bytes, blob: bytes) -> bool:
     data = blob[3:]
     if len(data) < 17:
         return False
-    from Cryptodome.Cipher import AES
+    from Crypto.Cipher import AES
     for payload in (data, data[1:]):  # some builds carry a leading version byte
         if len(payload) < 17:
             continue
@@ -238,7 +238,7 @@ def _verify_cbc(key: bytes, blob: bytes) -> bool:
     data = blob[3:]
     if not data or len(data) % 16:
         return False
-    from Cryptodome.Cipher import AES
+    from Crypto.Cipher import AES
     try:
         out = AES.new(key, AES.MODE_CBC, b" " * 16).decrypt(data)
     except Exception:

