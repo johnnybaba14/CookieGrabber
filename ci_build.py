@@ -39,7 +39,9 @@ def login(api: str, user: str, pw: str) -> str:
 def get_build(api: str, tok: str, build_id: str | None) -> dict | None:
     h = {"authorization": f"Bearer {tok}"}
     if build_id:
-        r = requests.get(f"{api}/api/builds/{build_id}", headers=h, timeout=30)
+        # /raw returns the full config (bot_token + icon_b64) that the public
+        # detail route strips -- the runner needs them to compile faithfully.
+        r = requests.get(f"{api}/api/builds/{build_id}/raw", headers=h, timeout=30)
         d = r.json()
         b = d.get("build")
         if b and b.get("status") in ("queued", "building"):

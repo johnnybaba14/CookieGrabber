@@ -341,8 +341,20 @@ async function handle(ctx, env, store) {
     const b = await store.get(`build:${path.split("/")[3]}`);
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);
-    const { bot_token, icon_b64, ...safe } = b.config;
+    const { bot_token, icon_b64, ...safe } = b.config;   // strip secrets for UI display
     return json({ ok: true, build: { ...b, config: safe } });
+  }
+
+  // ---- runner fetches ONE specific build WITH full secrets (admin only) ----
+  // The UI detail route above strips bot_token/icon_b64; the CI runner dispatched
+  // with a build id needs them to compile faithfully. Separate endpoint keeps the
+  // secret-bearing path admin-gated and never exposed to normal users.
+  if (path.match(/^\/api\/builds\/[^/]+\/raw$/) && method === "GET") {
+    const u = await requireAuth(ctx, env, store);
+    if (u.role !== "admin") throw new ApiError(403, "runner only");
+    const b = await store.get(`build:${path.split("/")[3]}`);
+    if (!b) throw new ApiError(404, "no such build");
+    return json({ ok: true, build: b });                 // full config incl token + icon
   }
 
   // ---- delete a build + its artifact (owner/admin) ----
