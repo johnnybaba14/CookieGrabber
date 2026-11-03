@@ -209,7 +209,7 @@ async function loadBuilds(){
     el.innerHTML="<table><tr><th>name</th><th>dest</th><th>status</th><th></th></tr>"+
       rows.map(b=>`<tr><td>${b.name}</td><td class="muted">...${(b.chat_id||"").slice(-4)}</td>
         <td><span class="pill ${b.status}">${b.status}</span>${b.error?`<div class=muted>${b.error}</div>`:""}</td>
-        <td class=row>${b.status==="done"?`<a href="${API}/api/builds/${b.id}/download" onclick="return dl('${b.id}')">download</a>`:""}
+        <td class=row>${b.status==="done"?`<a href="#" onclick="dl('${b.id}');return false;">download</a>`:""}
         <button class="danger" style="padding:5px 12px;font-size:12px" onclick="delBuild('${b.id}')">delete</button></td></tr>`).join("")+"</table>";
     setTimeout(loadBuilds, 4000);   // poll while queued/building
   }catch(e){ el.innerHTML=`<span class=err>${e.message}</span>`; }
@@ -219,14 +219,16 @@ async function delBuild(id){
   try{ const d=await api(`/api/builds/${id}`,{method:"DELETE"}); if(!d.ok) throw new Error(d.error||"failed"); loadBuilds(); }
   catch(e){ msg("buildMsg", e.message, "err"); }
 }
-async function dl(id){   // download via auth header, so plain link won't carry it
+async function dl(id){   // fetch with auth header, then trigger blob download.
   try{
     const r=await fetch(`${API}/api/builds/${id}/download`,{headers:{authorization:"Bearer "+TOKEN}});
-    if(!r.ok) throw new Error("artifact gone or not yours");
-    const blob=await r.blob(); const a=document.createElement("a");
-    a.href=URL.createObjectURL(blob); a.download="build.zip"; a.click();
+    if(!r.ok) throw new Error("artifact gone, expired, or not yours (HTTP "+r.status+")");
+    const cd=r.headers.get("content-disposition")||"";
+    const m=cd.match(/filename="?([^"]+)"?/); const fname=m?m[1]:(id+".zip");
+    const blob=await r.blob(); const url=URL.createObjectURL(blob);
+    const a=document.createElement("a"); a.href=url; a.download=fname; document.body.appendChild(a); a.click();
+    a.remove(); setTimeout(()=>URL.revokeObjectURL(url),2000);
   }catch(e){ alert(e.message); }
-  return false;
 }
 
 async function loadUsers(){
