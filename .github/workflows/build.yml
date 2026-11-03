@@ -56,10 +56,8 @@ jobs:
           BID: ${{ github.event.inputs.build_id }}
         shell: bash
         run: |
-          cd JohnWickGrabber
-          # build_id comes from a dispatch input: treat as untrusted. Allow only
-          # hex (our ids are 16-char hex) or empty; reject anything else rather
-          # than interpolate it into argv.
+          # repo root IS the JohnWickGrabber folder (pushed as repo top level),
+          # so ci_build.py and jwg_implant.py sit right here -- no subdir to cd into.
           if [ -n "$BID" ] && ! printf '%s' "$BID" | grep -Eq '^[0-9a-f]{8,32}$'; then
             echo "invalid build_id format, refusing"; exit 1
           fi
@@ -73,6 +71,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: built-exe
-          path: JohnWickGrabber/dist/*.exe
+          path: dist/*.exe
           if-no-files-found: ignore
           retention-days: 7
