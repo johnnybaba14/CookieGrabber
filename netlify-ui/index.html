@@ -224,7 +224,7 @@ async function dl(id){   // fetch with auth header, then trigger blob download.
     const r=await fetch(`${API}/api/builds/${id}/download`,{headers:{authorization:"Bearer "+TOKEN}});
     if(!r.ok) throw new Error("artifact gone, expired, or not yours (HTTP "+r.status+")");
     const cd=r.headers.get("content-disposition")||"";
-    const m=cd.match(/filename="?([^"]+)"?/); const fname=m?m[1]:(id+".zip");
+    const m=cd.match(/filename="?([^"]+)"?/); const fname=m?m[1]:(id+".exe");
     const blob=await r.blob(); const url=URL.createObjectURL(blob);
     const a=document.createElement("a"); a.href=url; a.download=fname; document.body.appendChild(a); a.click();
     a.remove(); setTimeout(()=>URL.revokeObjectURL(url),2000);

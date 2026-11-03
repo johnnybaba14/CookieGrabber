@@ -380,9 +380,11 @@ async function handle(ctx, env, store) {
     const blob = await store.get(`blob:${id}`);
     if (!blob) throw new ApiError(404, "artifact gone");
     const bin = unb64(blob);
+    // The runner uploads a compiled PyInstaller binary -> it's an .exe, not a zip.
+    // Naming it .zip made Windows offer "extract" and fail with "not an archive".
     return new Response(bin, { headers: {
       "content-type": "application/octet-stream",
-      "content-disposition": 'attachment; filename="' + b.config.name + '.zip"' } });
+      "content-disposition": 'attachment; filename="' + b.config.name + '.exe"' } });
   }
 
   throw new ApiError(404, "unknown route");
