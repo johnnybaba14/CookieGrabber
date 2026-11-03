@@ -76,53 +76,109 @@ async function readToken(env, tok) {
   return { id, role };
 }
 
-// ------------------------------------------------------------------ store (KV)
-// Builds and users are keyed individually (build:<id>, user:<id>). We enumerate
-// via KV's native list() with a prefix cursor rather than maintaining a separate
-// "idx" array -- that array was a read-modify-write race across edge locations
-// and silently lost builds when concurrent writes clobbered it. list() reflects
-// the actual stored keys, so nothing gets dropped.
+// ------------------------------------------------------------------ store (D1)
+// Relational backend replaces KV. Two reasons: (1) KV free tier caps reads at
+// 1000/day and list()-based enumeration blew through it, taking the panel down;
+// D1 free tier is 5M reads/day and answers queries directly. (2) A single SQL
+// row per build removes the read-modify-write index race that silently lost
+// builds. Interface mirrors the old Store so route code barely changes.
 class Store {
-  constructor(kv) { this.kv = kv; }
-  async get(k) { const v = await this.kv.get(k); return v ? JSON.parse(v) : null; }
-  async set(k, v) { await this.kv.put(k, JSON.stringify(v)); }
-  async del(k) { await this.kv.delete(k); }
+  constructor(d1, kv) { this.d1 = d1; this.kv = kv; }
 
-  // Enumerate all keys under a prefix, following KV cursors.
-  async _keysWithPrefix(prefix) {
-    const names = []; let cursor;
-    do {
-      const page = await this.kv.list({ prefix, cursor });
-      for (const k of page.keys) names.push(k.name);
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-    return names;
+  // ---- users ----
+  async saveUser(u) {
+    await this.d1.prepare(
+      `INSERT OR REPLACE INTO users (id,username,pw_hash,pw_salt,role,disabled,created)
+       VALUES (?1,?2,?3,?4,?5,?6,?7)`)
+      .bind(u.id, u.username, u.pw_hash, u.pw_salt, u.role, u.disabled ? 1 : 0, u.created).run();
   }
-
-  async saveUser(u) { await this.set(`user:${u.id}`, u); }
   async findByName(name) {
-    for (const key of await this._keysWithPrefix("user:")) {
-      const u = await this.get(key);
-      if (u && u.username.toLowerCase() === String(name).toLowerCase()) return u;
-    }
-    return null;
+    const r = await this.d1.prepare(
+      `SELECT * FROM users WHERE lower(username)=lower(?1) LIMIT 1`).bind(name).first();
+    return this._rowToUser(r);
+  }
+  async getUser(id) {
+    const r = await this.d1.prepare(`SELECT * FROM users WHERE id=?1`).bind(id).first();
+    return this._rowToUser(r);
   }
   async listUsers() {
-    const out = [];
-    for (const key of await this._keysWithPrefix("user:")) { const u = await this.get(key); if (u) out.push(u); }
-    return out.sort((a, b) => a.created - b.created);
+    const r = await this.d1.prepare(`SELECT * FROM users ORDER BY created ASC`).all();
+    return r.results.map((x) => this._rowToUser(x));
   }
   async deleteUser(id) {
-    await this.del(`user:${id}`);
-    for (const b of await this.listBuilds()) if (b.uid === id) { await this.del(`build:${b.id}`); await this.del(`blob:${b.id}`); }
+    await this.d1.prepare(`DELETE FROM builds WHERE uid=?1`).bind(id).run();
+    await this.d1.prepare(`DELETE FROM blobs WHERE id IN (SELECT id FROM builds WHERE uid=?1)`).bind(id).run();
+    await this.d1.prepare(`DELETE FROM users WHERE id=?1`).bind(id).run();
+  }
+  _rowToUser(r) {
+    if (!r) return null;
+    return { id: r.id, username: r.username, pw_hash: r.pw_hash, pw_salt: r.pw_salt,
+      role: r.role, disabled: !!r.disabled, created: r.created };
   }
 
-  async saveBuild(b) { await this.set(`build:${b.id}`, b); }
-  async listBuilds() {
-    const out = [];
-    for (const key of await this._keysWithPrefix("build:")) { const b = await this.get(key); if (b) out.push(b); }
-    return out;
+  // ---- builds ----
+  async saveBuild(b) {
+    const c = b.config || {};
+    await this.d1.prepare(
+      `INSERT OR REPLACE INTO builds
+       (id,uid,username,status,created,claimed_by,error,artifact,bot_token,chat_id,name,
+        licence_key,licence_url,steal_json,opts_json,icon_b64)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)`)
+      .bind(b.id, b.uid, b.username, b.status, b.created, b.claimed_by ?? null,
+        b.error ?? null, b.artifact ? 1 : 0, c.bot_token ?? "", c.chat_id ?? "", c.name ?? "",
+        c.licence_key ?? "", c.licence_url ?? "", JSON.stringify(c.steal ?? {}),
+        JSON.stringify(c.opts ?? {}), c.icon_b64 ?? "").run();
   }
+  async getBuild(id) {
+    const r = await this.d1.prepare(`SELECT * FROM builds WHERE id=?1`).bind(id).first();
+    return r ? this._rowToBuild(r) : null;
+  }
+  async listBuilds(uid = null) {
+    const q = uid
+      ? this.d1.prepare(`SELECT * FROM builds WHERE uid=?1 ORDER BY created DESC`).bind(uid)
+      : this.d1.prepare(`SELECT * FROM builds ORDER BY created DESC`);
+    const r = await q.all();
+    return r.results.map((x) => this._rowToBuild(x));
+  }
+  async claimNextQueued() {
+    // Atomic-ish: pick oldest queued, flip to building in one statement path.
+    const row = await this.d1.prepare(
+      `SELECT * FROM builds WHERE status='queued' ORDER BY created ASC LIMIT 1`).first();
+    if (!row) return null;
+    await this.d1.prepare(`UPDATE builds SET status='building', claimed_by='runner' WHERE id=?1`)
+      .bind(row.id).run();
+    return this._rowToBuild({ ...row, status: "building", claimed_by: "runner" });
+  }
+  async updateBuildStatus(id, patch) {
+    const sets = [], binds = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (["status", "error", "claimed_by", "artifact"].includes(k)) { sets.push(`${k}=?${binds.length + 1}`); binds.push(k === "artifact" ? (v ? 1 : 0) : v); }
+    }
+    if (!sets.length) return;
+    binds.push(id);
+    await this.d1.prepare(`UPDATE builds SET ${sets.join(",")} WHERE id=?${binds.length}`).bind(...binds).run();
+  }
+  async deleteBuild(id) {
+    await this.delBlob(id);                    // KV blob
+    await this.d1.prepare(`DELETE FROM builds WHERE id=?1`).bind(id).run();
+  }
+  _rowToBuild(r) {
+    let steal = {}, opts = {};
+    try { steal = JSON.parse(r.steal_json || "{}"); } catch {}
+    try { opts = JSON.parse(r.opts_json || "{}"); } catch {}
+    return { id: r.id, uid: r.uid, username: r.username, status: r.status, created: r.created,
+      claimed_by: r.claimed_by, error: r.error, artifact: !!r.artifact,
+      config: { bot_token: r.bot_token, chat_id: r.chat_id, name: r.name,
+        licence_key: r.licence_key, licence_url: r.licence_url, steal, opts, icon_b64: r.icon_b64 } };
+  }
+
+  // ---- blobs (compiled exe) in KV, NOT D1 ----
+  // A compiled PyInstaller exe is ~18MB base64; D1 free tier caps a row at 10MB.
+  // KV allows 25MB values and its *write* path isn't the thing that hit the daily
+  // read cap -- we no longer list() on every request, so per-key get/put is fine.
+  async setBlob(id, data) { await this.kv.put(`blob:${id}`, data); }
+  async getBlob(id) { return await this.kv.get(`blob:${id}`); }
+  async delBlob(id) { await this.kv.delete(`blob:${id}`); }
 }
 
 // ------------------------------------------------------------------ helpers
@@ -145,7 +201,7 @@ async function requireAuth(ctx, env, store) {
   const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
   const claims = await readToken(env, tok);
   if (!claims) throw new ApiError(401, "auth required");
-  const u = await store.get(`user:${claims.id}`);
+  const u = await store.getUser(claims.id);
   if (!u || u.disabled) throw new ApiError(403, "account disabled");
   return u;
 }
@@ -288,7 +344,7 @@ async function handle(ctx, env, store) {
     const me = await requireAdmin(ctx, env, store);
     const id = path.split("/")[3];
     const b = await request.json().catch(() => ({}));
-    const target = await store.get(`user:${id}`);
+    const target = await store.getUser(id);
     if (!target) throw new ApiError(404, "no such user");
     if (b.action === "disable" && id !== me.id) { target.disabled = true; await store.saveUser(target); }
     else if (b.action === "enable") { target.disabled = false; await store.saveUser(target); }
@@ -316,43 +372,38 @@ async function handle(ctx, env, store) {
     return json({ ok: true, build: { ...build, config: safe } });
   }
 
-  // ---- list builds: mine, or all if admin ----
+  // ---- list builds: mine, or all if admin; ?claim=1 = runner grabs next queued ----
   if (path === "/api/builds" && method === "GET") {
     const u = await requireAuth(ctx, env, store);
-    let rows = await store.listBuilds();
     if (url.searchParams.get("claim") === "1") {
-      // Runner mode (admin-only): atomically grab the next queued build WITH its token.
       if (u.role !== "admin") throw new ApiError(403, "runner must be admin-scoped");
-      const q = rows.filter((b) => b.status === "queued").sort((a, b) => a.created - b.created);
-      if (!q.length) return json({ ok: true, build: null });
-      const b = q[0]; b.status = "building"; b.claimed_by = "runner"; await store.saveBuild(b);
+      const b = await store.claimNextQueued();   // single UPDATE flips status; no race
       return json({ ok: true, build: b });
     }
-    rows = u.role === "admin" ? rows : rows.filter((b) => b.uid === u.id);
-    rows.sort((a, b) => b.created - a.created);
+    const rows = await store.listBuilds(u.role === "admin" ? null : u.id);
     const slim = rows.map((b) => ({ id: b.id, name: b.config.name, chat_id: b.config.chat_id,
       status: b.status, created: b.created, artifact: !!b.artifact, error: b.error }));
     return json({ ok: true, builds: slim });
   }
 
-  // ---- one build detail (owner/admin) ----
+  // ---- one build detail (owner/admin), secrets stripped for UI display ----
   if (path.match(/^\/api\/builds\/[^/]+$/) && method === "GET") {
     const u = await requireAuth(ctx, env, store);
-    const b = await store.get(`build:${path.split("/")[3]}`);
+    const b = await store.getBuild(path.split("/")[3]);
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);
-    const { bot_token, icon_b64, ...safe } = b.config;   // strip secrets for UI display
+    const { bot_token, icon_b64, ...safe } = b.config;
     return json({ ok: true, build: { ...b, config: safe } });
   }
 
   // ---- runner fetches ONE specific build WITH full secrets (admin only) ----
-  // The UI detail route above strips bot_token/icon_b64; the CI runner dispatched
-  // with a build id needs them to compile faithfully. Separate endpoint keeps the
+  // The UI detail route strips bot_token/icon_b64; the CI runner dispatched with a
+  // build id needs them to compile faithfully. Separate endpoint keeps the
   // secret-bearing path admin-gated and never exposed to normal users.
   if (path.match(/^\/api\/builds\/[^/]+\/raw$/) && method === "GET") {
     const u = await requireAuth(ctx, env, store);
     if (u.role !== "admin") throw new ApiError(403, "runner only");
-    const b = await store.get(`build:${path.split("/")[3]}`);
+    const b = await store.getBuild(path.split("/")[3]);
     if (!b) throw new ApiError(404, "no such build");
     return json({ ok: true, build: b });                 // full config incl token + icon
   }
@@ -361,32 +412,31 @@ async function handle(ctx, env, store) {
   if (path.match(/^\/api\/builds\/[^/]+$/) && method === "DELETE") {
     const u = await requireAuth(ctx, env, store);
     const id = path.split("/")[3];
-    const b = await store.get(`build:${id}`);
+    const b = await store.getBuild(id);
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);                 // only owner or admin can remove it
-    await store.del(`blob:${id}`);            // drop the stored exe first
-    await store.del(`build:${id}`);           // list() reflects this immediately; no index to fix
+    await store.deleteBuild(id);              // removes blob + row together
     return json({ ok: true, deleted: id });
   }
 
-  // ---- runner uploads finished artifact (base64 zip/exe) ----
+  // ---- runner uploads finished artifact (base64 exe) ----
   if (path.match(/^\/api\/builds\/[^/]+\/upload$/) && method === "POST") {
     const u = await requireAuth(ctx, env, store);
     if (u.role !== "admin") throw new ApiError(403, "runner only");
     const id = path.split("/")[3];
-    const b = await store.get(`build:${id}`);
+    const b = await store.getBuild(id);
     if (!b) throw new ApiError(404, "no such build");
     const body = await request.json().catch(() => ({}));
-    if (body.status === "building") { b.status = "building"; }
-    else if (body.status === "failed") { b.status = "failed"; b.error = String(body.error || "build failed").slice(0, 500); }
+    if (body.status === "building") { await store.updateBuildStatus(id, { status: "building" }); }
+    else if (body.status === "failed") { await store.updateBuildStatus(id, { status: "failed", error: String(body.error || "build failed").slice(0, 500) }); }
     else {
       const blob = String(body.data_base64 || "");
       if (!blob) throw new ApiError(400, "no artifact data");
-      if (blob.length > 22_000_000) throw new ApiError(413, "artifact too large for KV (~25MB cap)");
-      await store.set(`blob:${id}`, blob);
-      b.status = "done"; b.artifact = id; b.error = null;
+      // KV value cap is 25MB; guard under it so an oversized upload fails clean.
+      if (blob.length > 24_000_000) throw new ApiError(413, "artifact too large (>~18MB exe)");
+      await store.setBlob(id, blob);
+      await store.updateBuildStatus(id, { status: "done", artifact: 1, error: null });
     }
-    await store.saveBuild(b);
     return json({ ok: true });
   }
 
@@ -394,10 +444,10 @@ async function handle(ctx, env, store) {
   if (path.match(/^\/api\/builds\/[^/]+\/download$/) && method === "GET") {
     const u = await requireAuth(ctx, env, store);
     const id = path.split("/")[3];
-    const b = await store.get(`build:${id}`);
+    const b = await store.getBuild(id);
     if (!b) throw new ApiError(404, "no such build");
     assertCanReadBuild(u, b);
-    const blob = await store.get(`blob:${id}`);
+    const blob = await store.getBlob(id);
     if (!blob) throw new ApiError(404, "artifact gone");
     const bin = unb64(blob);
     // The runner uploads a compiled PyInstaller binary -> it's an .exe, not a zip.
@@ -415,7 +465,7 @@ export default {
   async fetch(request, env, ctx) {
     const cors = corsHeaders(request.headers.get("origin"), env.ALLOWED_ORIGIN);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-    const store = new Store(env.PANEL_KV);
+    const store = new Store(env.DB, env.ARTIFACTS);
     // Pass the REAL Cloudflare ctx through so ctx.waitUntil() actually extends
     // the request lifetime. A hand-made waitUntil that runs after we return the
     // Response gets frozen by the runtime before the GitHub dispatch finishes --

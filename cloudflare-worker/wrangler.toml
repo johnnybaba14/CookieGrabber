@@ -1,14 +1,21 @@
 # wrangler.toml for the JohnWick panel API worker.
-# After `wrangler kv namespace create PANEL_KV`, paste the generated id below.
+# Backend is D1 (relational), not KV -- KV free tier's 1000 reads/day cap was
+# exhausted by list()-based enumeration and took the panel down. D1 is 5M/day.
 
 name = "jwg-panel-api"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-# Bind a KV namespace named PANEL_KV (the code reads env.PANEL_KV).
+# Bind the D1 database; code reads env.DB.
+[[d1_databases]]
+binding = "DB"
+database_name = "jwg-panel"
+database_id = "4b63ee6e-fb0d-4741-8c30-4def62a4df07"
+
+# Compiled exes go to KV (25MB value cap), not D1 (10MB row cap). Code reads env.ARTIFACTS.
 [[kv_namespaces]]
-binding = "PANEL_KV"
-id = "6023d38003674924a4980f9467e4c423"
+binding = "ARTIFACTS"
+id = "bdf23cf5a2f14e3bb91586d1ff981951"
 
 # Secrets are set with `wrangler secret put NAME` -- NEVER write real values here.
 #   SESSION_SECRET : long random string, signs session tokens
